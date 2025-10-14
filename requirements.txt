@@ -1,0 +1,16 @@
+# Core ML stack
+torch>=2.2.0
+transformers>=4.40.0
+accelerate>=0.30.0
+datasets>=2.19.0
+huggingface_hub>=0.24.0
+bitsandbytes
+
+# Logging and analysis
+pandas>=2.0.0
+jsonlines>=4.0.0
+
+# Utilities
+tqdm>=4.65.0
+safetensors>=0.4.2
+numpy>=1.26.0
