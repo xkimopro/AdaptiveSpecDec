@@ -30,6 +30,11 @@ def _accept_or_resample(draft_logits_pos: torch.Tensor,
     device = target_logits_pos.device
     draft_logits_pos = draft_logits_pos.to(device)
     
+    # Handle vocabulary size mismatch: truncate or pad to match sizes
+    min_vocab = min(draft_logits_pos.shape[-1], target_logits_pos.shape[-1])
+    draft_logits_pos = draft_logits_pos[..., :min_vocab]
+    target_logits_pos = target_logits_pos[..., :min_vocab]
+    
     q = _safe_probs(draft_logits_pos)
     p = _safe_probs(target_logits_pos)
 
@@ -64,7 +69,7 @@ def prepare_prompt(prompt, tokenizer):
         tokenizer: Tokenizer to use for special tokens
     
     Returns:
-        Cleaned prompt ready for generation
+        Cleaned prompt ready for generation (with proper chat template if available)
     """
     # Remove common template artifacts and special tokens
     artifacts = ["<|assistant|>", "<|user|>", "<|system|>", "<|im_start|>", "<|im_end|>"]
@@ -94,9 +99,23 @@ def prepare_prompt(prompt, tokenizer):
     
     prompt = ' '.join(cleaned_lines).strip()
     
-    # Note: We DON'T add EOS to the prompt - that would signal the model to stop
-    # The EOS token is used by the model to signal when IT has finished generating
-    # Adding it to the input would be like asking "please stop before you start"
+    # For Qwen models with chat templates, apply the template properly
+    # This ensures the model knows when to stop generating (at <|im_end|>)
+    if hasattr(tokenizer, 'apply_chat_template') and 'Qwen' in str(tokenizer.__class__):
+        try:
+            # Format as a single user message
+            messages = [{"role": "user", "content": prompt}]
+            # apply_chat_template with tokenize=False returns the formatted string
+            # add_generation_prompt=True adds the assistant prefix so model starts generating
+            prompt = tokenizer.apply_chat_template(
+                messages, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+        except Exception as e:
+            # If chat template fails, fall back to raw prompt
+            print(f"[WARNING] Could not apply chat template: {e}")
+            pass
     
     return prompt
 
@@ -106,7 +125,8 @@ def load_models_and_tokenizers(draft_model_name, target_model_name, cache_dir):
     Detects pre-quantized models (with -bnb-4bit or -8bit suffix) and loads them directly.
     Otherwise, applies 4-bit quantization and saves to cache_dir/quantized_models.
     """
-    print("Loading Falcon3 models... (This might take a while)")
+    print(f"Loading models: {draft_model_name} (draft) → {target_model_name} (target)")
+    print("(This might take a while...)")
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
@@ -119,7 +139,7 @@ def load_models_and_tokenizers(draft_model_name, target_model_name, cache_dir):
         is_prequantized = "-bnb-4bit" in model_name or "-8bit" in model_name
         
         if is_prequantized:
-            print(f"Loading Falcon3 {model_type} model (pre-quantized): {model_name}")
+            print(f"Loading {model_type} model (pre-quantized): {model_name}")
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 device_map="auto",
@@ -131,14 +151,14 @@ def load_models_and_tokenizers(draft_model_name, target_model_name, cache_dir):
             quantized_model_path = os.path.join(cache_dir, "quantized_models", model_name.replace("/", "_"))
             
             if os.path.exists(quantized_model_path):
-                print(f"Loading Falcon3 {model_type} model from {quantized_model_path}")
+                print(f"Loading {model_type} model from {quantized_model_path}")
                 model = AutoModelForCausalLM.from_pretrained(
                     quantized_model_path, 
                     device_map="auto",
                     trust_remote_code=True
                 )
             else:
-                print(f"Loading and quantizing Falcon3 {model_type} model: {model_name}")
+                print(f"Loading and quantizing {model_type} model: {model_name}")
                 quantization_config = BitsAndBytesConfig(load_in_4bit=True)
                 model = AutoModelForCausalLM.from_pretrained(
                     model_name,
@@ -155,7 +175,7 @@ def load_models_and_tokenizers(draft_model_name, target_model_name, cache_dir):
     target_model = load_or_quantize_model(target_model_name, "Target")
 
     # CRITICAL: Use the same tokenizer for both models to ensure vocabulary consistency
-    # Since both are Falcon3 models, they share the same tokenizer, but we load only one instance
+    # For model families (Qwen, Falcon, Llama), models in the same family share tokenizers
     tokenizer = AutoTokenizer.from_pretrained(target_model_name, cache_dir=cache_dir, trust_remote_code=True)
 
     # Set pad token to a different token than EOS to avoid confusion
@@ -173,16 +193,16 @@ def load_models_and_tokenizers(draft_model_name, target_model_name, cache_dir):
     print(f"PAD token: '{tokenizer.pad_token}' (ID: {tokenizer.pad_token_id})")
     print(f"Has chat template: {tokenizer.chat_template is not None}")
         
-    print("\nFalcon3 models loaded.")
+    print("\n✓ Models loaded successfully")
     
     # Report VRAM usage for each model
     if torch.cuda.is_available():
         draft_vram_gb = torch.cuda.memory_allocated(draft_model.device) / 1e9
         target_vram_gb = torch.cuda.memory_allocated(target_model.device) / 1e9
         print(f"\n--- VRAM Usage ---")
-        print(f"Falcon3 Draft Model (1B):  {draft_vram_gb:.2f} GB")
-        print(f"Falcon3 Target Model (7B): {target_vram_gb:.2f} GB")
-        print(f"Total VRAM Used:           {draft_vram_gb + target_vram_gb:.2f} GB")
+        print(f"Draft Model:  {draft_vram_gb:.2f} GB")
+        print(f"Target Model: {target_vram_gb:.2f} GB")
+        print(f"Total VRAM:   {draft_vram_gb + target_vram_gb:.2f} GB")
     
     # Return the same tokenizer for both draft and target to ensure consistency
     return draft_model, tokenizer, target_model, tokenizer
@@ -209,12 +229,12 @@ def benchmark_model_solo(model, tokenizer, prompt, max_new_tokens, verbose=False
         attention_mask=attention_mask,
         max_new_tokens=max_new_tokens, 
         do_sample=True,
-        temperature=0.7,
+        temperature=0.1,
         top_p=0.9,
         pad_token_id=tokenizer.eos_token_id,
         eos_token_id=tokenizer.eos_token_id,
-        # Don't stop early, generate requested tokens
-        min_new_tokens=min(10, max_new_tokens)  # Generate at least 10 tokens
+        # Let the model stop naturally when it wants to
+        min_new_tokens=1  # Allow stopping after first token if EOS is generated
     )
     runtime = time.time() - start_time
     
@@ -232,7 +252,8 @@ def benchmark_model_solo(model, tokenizer, prompt, max_new_tokens, verbose=False
     
     return generated_text, runtime, len(generated_tokens)
 
-def speculative_decoding(prompt, draft_model, draft_tokenizer, target_model, target_tokenizer, max_new_tokens, L, telemetry, verbose=False):
+def speculative_decoding(prompt, draft_model, draft_tokenizer, target_model, target_tokenizer, max_new_tokens, L, telemetry, verbose=False, 
+                        temperature=0.1, top_p=0.9, seed=None):
     """
     Performs speculative decoding with unbiased stochastic acceptance and residual sampling.
     
@@ -250,6 +271,7 @@ def speculative_decoding(prompt, draft_model, draft_tokenizer, target_model, tar
     - Stochastic acceptance (not deterministic threshold)
     - Residual sampling on rejection (unbiased)
     - No heuristic "reacceptance" that would bias the distribution
+    - CONSISTENT sampling parameters (temperature, top_p) for draft and target
     
     Expected tokens per iteration:
     - If all L tokens accepted: L + 1 tokens from 1 target forward pass
@@ -260,6 +282,9 @@ def speculative_decoding(prompt, draft_model, draft_tokenizer, target_model, tar
     
     Args:
         verbose: If True, prints detailed verification information for each step.
+        temperature: Sampling temperature (must match benchmark settings)
+        top_p: Nucleus sampling parameter (must match benchmark settings)
+        seed: Random seed for reproducibility (optional)
     """
     # Encode the prompt using the target tokenizer, which defines the vocabulary space.
     inputs = target_tokenizer(prompt, return_tensors="pt")
@@ -271,6 +296,11 @@ def speculative_decoding(prompt, draft_model, draft_tokenizer, target_model, tar
     total_drafted = 0
     
     overall_start_time = time.time()
+    
+    # Initialize RNG for reproducibility
+    if seed is not None:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
     
     step_num = 0
 
@@ -290,8 +320,28 @@ def speculative_decoding(prompt, draft_model, draft_tokenizer, target_model, tar
                 # The input is already on the correct device.
                 draft_logits = draft_model(draft_input_ids, attention_mask=draft_attention_mask).logits[:, -1, :]
             
-            # Use greedy sampling for the draft tokens
-            next_token = torch.argmax(draft_logits, dim=-1).unsqueeze(0)
+            # CRITICAL: Use SAME sampling as target (temperature, top_p)
+            # Apply temperature scaling
+            draft_logits_scaled = draft_logits / temperature
+            # Truncate to common vocabulary if needed
+            min_vocab = min(draft_logits_scaled.shape[-1], target_tokenizer.vocab_size)
+            draft_logits_scaled = draft_logits_scaled[..., :min_vocab]
+            # Apply top-p (nucleus) sampling
+            draft_probs = _safe_probs(draft_logits_scaled).squeeze(0)  # Shape: (vocab_size,)
+            if top_p < 1.0:
+                sorted_probs, sorted_indices = torch.sort(draft_probs, descending=True, dim=-1)
+                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+                # Remove tokens AFTER the cumulative probability exceeds top_p
+                # Shift right by 1 so we keep tokens up to and including the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = False
+                # Map back to original indices and zero out
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                draft_probs = draft_probs.clone()
+                draft_probs[indices_to_remove] = 0.0
+                draft_probs = draft_probs / draft_probs.sum()
+            next_token = torch.multinomial(draft_probs, num_samples=1).unsqueeze(0)
             draft_tokens.append(next_token)
             # Both tensors are now on draft_model.device, so cat will work.
             draft_input_ids = torch.cat([draft_input_ids, next_token], dim=1)
@@ -424,8 +474,13 @@ def speculative_decoding(prompt, draft_model, draft_tokenizer, target_model, tar
         if telemetry:
             # Calculate KL divergence on the distributions that were compared
             # Move both to the same device (target_model.device) before calculation
-            draft_log_probs = torch.log_softmax(draft_verify_logits.to(target_model.device).to(torch.float32), dim=-1)
-            target_probs = torch.softmax(verify_logits.to(torch.float32), dim=-1)
+            # Handle vocabulary size mismatch: truncate to common vocabulary
+            min_vocab = min(draft_verify_logits.shape[-1], verify_logits.shape[-1])
+            draft_verify_logits_aligned = draft_verify_logits[..., :min_vocab].to(target_model.device).to(torch.float32)
+            verify_logits_aligned = verify_logits[..., :min_vocab].to(torch.float32)
+            
+            draft_log_probs = torch.log_softmax(draft_verify_logits_aligned, dim=-1)
+            target_probs = torch.softmax(verify_logits_aligned, dim=-1)
 
             kl_div = torch.nn.functional.kl_div(
                 draft_log_probs,
@@ -457,8 +512,12 @@ def speculative_decoding(prompt, draft_model, draft_tokenizer, target_model, tar
                 }
             })
         
-        # Only stop if we hit EOS AND we've generated a reasonable amount
-        if len(generated_tokens) >= 10 and any(t == target_tokenizer.eos_token_id for t in tokens_to_add):
+        # Stop if we hit EOS token - let the model decide when to stop naturally
+        if any(t == target_tokenizer.eos_token_id for t in tokens_to_add):
+            break
+        
+        # Also check if we've reached max tokens to prevent infinite loops
+        if len(generated_tokens) >= max_new_tokens:
             break
     
     overall_runtime = time.time() - overall_start_time
@@ -468,7 +527,7 @@ def speculative_decoding(prompt, draft_model, draft_tokenizer, target_model, tar
 
 def main():
     print("\n" + "="*80)
-    print("🚀 Running Speculative Decoding with Falcon3 Models (1B → 7B, 4-bit Quantized)")
+    print("🚀 Running Speculative Decoding with Qwen2.5 Models (3B → 32B, 4-bit Quantized)")
     print("="*80 + "\n")
     
     parser = argparse.ArgumentParser(description="Speculative Decoding Benchmarking Pipeline")
@@ -476,8 +535,8 @@ def main():
     parser.add_argument("--L", type=int, default=4, help="Lookahead for drafting in speculative decoding.")
     parser.add_argument("--output", type=str, default="telemetry.jsonl", help="Output telemetry file.")
     parser.add_argument("--cache_dir", type=str, default="/home1/10899/kimopro/WORK/ml_data", help="Directory for caching models and data.")
-    parser.add_argument("--draft_model", type=str, default="tiiuae/Falcon3-1B-Instruct")
-    parser.add_argument("--target_model", type=str, default="tiiuae/Falcon3-7B-Instruct")
+    parser.add_argument("--draft_model", type=str, default="Qwen/Qwen2.5-3B-Instruct")
+    parser.add_argument("--target_model", type=str, default="Qwen/Qwen2.5-32B-Instruct")
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--max_new_tokens", type=int, default=50)
     parser.add_argument("--prompt", type=str, default=None, help="Single custom prompt to benchmark (alternative to dataset)")
@@ -512,6 +571,17 @@ def main():
     # Clean and prepare all prompts (remove artifacts and gibberish)
     prompts = [prepare_prompt(p, target_tokenizer) for p in raw_prompts]
     print(f"\n✓ Prepared {len(prompts)} clean prompts (removed templates and artifacts)")
+    
+    # Verify parameter consistency
+    print(f"\n--- Parameter Consistency Check ---")
+    print(f"Sampling: do_sample=True")
+    print(f"Temperature: 0.1 (draft=target)")
+    print(f"Top-p: 0.9 (draft=target)")
+    print(f"EOS token ID: {target_tokenizer.eos_token_id}")
+    print(f"PAD token ID: {target_tokenizer.pad_token_id}")
+    print(f"Tokenizer: {args.target_model} (shared)")
+    print(f"RNG seed: None (stochastic)")
+    print(f"{'='*40}")
     
     telemetry = Telemetry(args.output)
     
@@ -566,7 +636,10 @@ def main():
         spec_text, spec_runtime, spec_num_tokens, num_accepted, num_drafted = speculative_decoding(
             prompt, draft_model, draft_tokenizer, target_model, target_tokenizer,
             max_new_tokens=args.max_new_tokens, L=args.L, telemetry=telemetry,
-            verbose=show_detailed_verification
+            verbose=show_detailed_verification,
+            temperature=0.1,  # MUST match benchmark_model_solo settings
+            top_p=0.9,  # MUST match benchmark_model_solo settings
+            seed=None  # Set to fixed value for reproducibility
         )
         spec_dec_times.append(spec_runtime)
         total_tokens_generated.append(spec_num_tokens)
@@ -621,8 +694,10 @@ def main():
         print(f"Generated Text: {spec_text}")
     
     print("\n" + "="*80)
-    print(f"🚀 Falcon3 Speculative Decoding run complete: draft=1B, target=7B, "
-          f"acceptance_rate={statistics.mean(acceptance_rates):.1%}, speedup={speedup:.2f}x")
+    print(f"🚀 Speculative Decoding run complete!")
+    print(f"   Draft: {args.draft_model}")
+    print(f"   Target: {args.target_model}")
+    print(f"   Acceptance rate: {statistics.mean(acceptance_rates):.1%}, Speedup: {speedup:.2f}x")
     print("="*80 + "\n")
 
 
