@@ -125,58 +125,84 @@ def load_models_and_tokenizers(draft_model_name, target_model_name, cache_dir):
     Detects pre-quantized models (with -bnb-4bit or -8bit suffix) and loads them directly.
     Otherwise, applies 4-bit quantization and saves to cache_dir/quantized_models.
     """
+    print("🔄 [10%] Loading models and tokenizers...")
     print(f"Loading models: {draft_model_name} (draft) → {target_model_name} (target)")
     print("(This might take a while...)")
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
-        print("Warning: CUDA not available, using CPU. This will be slow.")
+        raise RuntimeError("CUDA GPU required but not available. This pipeline requires GPU acceleration.")
     
     print(f"Using device: {device}")
 
     def load_or_quantize_model(model_name, model_type=""):
+        print(f"🔄 [20%] Loading {model_type} model...")
         # Check if the model is already pre-quantized
         is_prequantized = "-bnb-4bit" in model_name or "-8bit" in model_name
-        
+
+        # First try: load pre-quantized model if the name indicates it
         if is_prequantized:
             print(f"Loading {model_type} model (pre-quantized): {model_name}")
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map="auto",
-                cache_dir=cache_dir,
-                trust_remote_code=True
-            )
-        else:
-            # Check if we have a locally saved quantized version
-            quantized_model_path = os.path.join(cache_dir, "quantized_models", model_name.replace("/", "_"))
-            
-            if os.path.exists(quantized_model_path):
-                print(f"Loading {model_type} model from {quantized_model_path}")
-                model = AutoModelForCausalLM.from_pretrained(
-                    quantized_model_path, 
-                    device_map="auto",
-                    trust_remote_code=True
-                )
-            else:
-                print(f"Loading and quantizing {model_type} model: {model_name}")
-                quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+            try:
                 model = AutoModelForCausalLM.from_pretrained(
                     model_name,
-                    quantization_config=quantization_config,
                     device_map="auto",
                     cache_dir=cache_dir,
                     trust_remote_code=True
                 )
+                return model
+            except Exception as e:
+                # Common causes: private/gated repo or incorrect name. Fall back to base model name.
+                print(f"[WARN] Could not load pre-quantized model '{model_name}': {e}")
+                base_model_name = model_name.replace("-bnb-4bit", "").replace("-8bit", "")
+                print(f"[INFO] Falling back to base model '{base_model_name}' and performing local 4-bit quantization (this may take a while).")
+                model_name = base_model_name
+                is_prequantized = False
+
+        # If not prequantized (or fallback), try to load a locally cached quantized copy or quantize on the fly
+        quantized_model_path = os.path.join(cache_dir, "quantized_models", model_name.replace("/", "_"))
+
+        if os.path.exists(quantized_model_path):
+            print(f"Loading {model_type} model from {quantized_model_path}")
+            model = AutoModelForCausalLM.from_pretrained(
+                quantized_model_path, 
+                device_map="auto",
+                trust_remote_code=True
+            )
+        else:
+            print(f"Loading and quantizing {model_type} model: {model_name}")
+            quantization_config = BitsAndBytesConfig(load_in_4bit=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                quantization_config=quantization_config,
+                device_map="auto",
+                cache_dir=cache_dir,
+                trust_remote_code=True
+            )
+            try:
                 print(f"Saving quantized model to {quantized_model_path}")
                 model.save_pretrained(quantized_model_path)
+            except Exception:
+                # Best-effort save; non-critical if saving fails due to FS permissions
+                print(f"[WARN] Could not save quantized model to {quantized_model_path} (permission or filesystem issue). Continuing without saving.")
         return model
 
     draft_model = load_or_quantize_model(draft_model_name, "Draft")
+    print("🔄 [40%] Draft model loaded")
     target_model = load_or_quantize_model(target_model_name, "Target")
+    print("🔄 [60%] Target model loaded")
 
     # CRITICAL: Use the same tokenizer for both models to ensure vocabulary consistency
     # For model families (Qwen, Falcon, Llama), models in the same family share tokenizers
-    tokenizer = AutoTokenizer.from_pretrained(target_model_name, cache_dir=cache_dir, trust_remote_code=True)
+    print("🔄 [70%] Loading tokenizer...")
+    # Try to load tokenizer for the exact target name; if that fails (e.g., pre-quantized name not accessible), fall back to base name
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(target_model_name, cache_dir=cache_dir, trust_remote_code=True)
+    except Exception as e:
+        print(f"[WARN] Could not load tokenizer for '{target_model_name}': {e}")
+        fallback_name = target_model_name.replace("-bnb-4bit", "").replace("-8bit", "")
+        print(f"[INFO] Falling back to tokenizer from '{fallback_name}'")
+        tokenizer = AutoTokenizer.from_pretrained(fallback_name, cache_dir=cache_dir, trust_remote_code=True)
 
     # Set pad token to a different token than EOS to avoid confusion
     if tokenizer.pad_token is None:
@@ -186,6 +212,7 @@ def load_models_and_tokenizers(draft_model_name, target_model_name, cache_dir):
             tokenizer.pad_token_id = tokenizer.eos_token_id
     
     # Debug tokenizer info
+    print("🔄 [80%] Tokenizer configured")
     print(f"\n--- Tokenizer Info ---")
     print(f"Vocab size: {tokenizer.vocab_size}")
     print(f"EOS token: '{tokenizer.eos_token}' (ID: {tokenizer.eos_token_id})")
@@ -193,7 +220,7 @@ def load_models_and_tokenizers(draft_model_name, target_model_name, cache_dir):
     print(f"PAD token: '{tokenizer.pad_token}' (ID: {tokenizer.pad_token_id})")
     print(f"Has chat template: {tokenizer.chat_template is not None}")
         
-    print("\n✓ Models loaded successfully")
+    print("✅ [90%] Models loaded successfully")
     
     # Report VRAM usage for each model
     if torch.cuda.is_available():
@@ -204,6 +231,7 @@ def load_models_and_tokenizers(draft_model_name, target_model_name, cache_dir):
         print(f"Target Model: {target_vram_gb:.2f} GB")
         print(f"Total VRAM:   {draft_vram_gb + target_vram_gb:.2f} GB")
     
+    print("✅ [100%] Setup complete!")
     # Return the same tokenizer for both draft and target to ensure consistency
     return draft_model, tokenizer, target_model, tokenizer
 
@@ -527,16 +555,17 @@ def speculative_decoding(prompt, draft_model, draft_tokenizer, target_model, tar
 
 def main():
     print("\n" + "="*80)
-    print("🚀 Running Speculative Decoding with Qwen2.5 Models (3B → 32B, 4-bit Quantized)")
+    print("🚀 Running Speculative Decoding with Qwen2.5 Models (3B → 72B, 4-bit Quantized)")
     print("="*80 + "\n")
     
     parser = argparse.ArgumentParser(description="Speculative Decoding Benchmarking Pipeline")
     parser.add_argument("--dataset", type=str, default="alpaca-mini", help="Dataset to use.")
     parser.add_argument("--L", type=int, default=4, help="Lookahead for drafting in speculative decoding.")
     parser.add_argument("--output", type=str, default="telemetry.jsonl", help="Output telemetry file.")
-    parser.add_argument("--cache_dir", type=str, default="/home1/10899/kimopro/WORK/ml_data", help="Directory for caching models and data.")
+    parser.add_argument("--cache_dir", type=str, default="/home1/10899/kimopro/SCRATCH/ml_data", help="Directory for caching models and data.")
     parser.add_argument("--draft_model", type=str, default="Qwen/Qwen2.5-3B-Instruct")
-    parser.add_argument("--target_model", type=str, default="Qwen/Qwen2.5-32B-Instruct")
+    # Default target changed to 72B quantized (pre-quantized model name includes -bnb-4bit)
+    parser.add_argument("--target_model", type=str, default="Qwen/Qwen2.5-72B-Instruct-bnb-4bit")
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--max_new_tokens", type=int, default=50)
     parser.add_argument("--prompt", type=str, default=None, help="Single custom prompt to benchmark (alternative to dataset)")
@@ -546,22 +575,23 @@ def main():
 
     # Determine prompt source (before loading heavy models)
     if args.prompt:
-        print(f"\n📝 Using single custom prompt")
+        print("� [5%] Using single custom prompt")
         raw_prompts = [args.prompt]
     else:
         # Load data from dataset
+        print("🔄 [5%] Loading dataset...")
         all_prompts = get_dataset(args.dataset, subset_size=max(1000, args.num_samples * 10), cache_dir=args.cache_dir)
         
         if args.sample_ids:
             # Parse specific sample IDs
             sample_ids = [int(x.strip()) for x in args.sample_ids.split(',')]
             raw_prompts = [all_prompts[i] for i in sample_ids if i < len(all_prompts)]
-            print(f"\n📌 Selected specific samples: {sample_ids}")
+            print(f"📌 Selected specific samples: {sample_ids}")
             print(f"✓ Loaded {len(raw_prompts)} prompts")
         else:
             # Use first N samples (deterministic)
             raw_prompts = all_prompts[:args.num_samples]
-            print(f"\n📊 Using first {args.num_samples} samples from {args.dataset}")
+            print(f"📊 Using first {args.num_samples} samples from {args.dataset}")
     
     # Load models and tokenizer
     draft_model, draft_tokenizer, target_model, target_tokenizer = load_models_and_tokenizers(
@@ -569,8 +599,9 @@ def main():
     )
     
     # Clean and prepare all prompts (remove artifacts and gibberish)
+    print("🔄 [95%] Preparing prompts...")
     prompts = [prepare_prompt(p, target_tokenizer) for p in raw_prompts]
-    print(f"\n✓ Prepared {len(prompts)} clean prompts (removed templates and artifacts)")
+    print(f"✅ [100%] Prepared {len(prompts)} clean prompts (removed templates and artifacts)")
     
     # Verify parameter consistency
     print(f"\n--- Parameter Consistency Check ---")
@@ -595,6 +626,9 @@ def main():
     print(f"\n--- Starting Benchmarks (L={args.L}, {args.num_samples} samples) ---")
 
     for i, prompt in enumerate(prompts):
+        progress_pct = int(100 * (i + 1) / len(prompts))
+        print(f"\n🔄 [{progress_pct}%] Processing sample {i+1}/{len(prompts)}")
+        
         # Enable verbose mode for first 2 samples to debug
         show_detailed_verification = (i < 2)
         
