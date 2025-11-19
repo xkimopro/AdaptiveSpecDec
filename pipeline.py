@@ -2,11 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-Speculative Decoding Benchmark (Cleaned)
-- Always-ON Speculative Decoding
-- Removed solo target/draft runs
-- Adds 'speedup_factor' to CSV
-- Logs telemetry and per-sample summary
+Speculative Decoding Benchmark (GREEDY DECODING VERSION)
+- All token generation is done via argmax (deterministic).
+- Sampling-related logic (temperature, top_p) has been removed.
 """
 
 from __future__ import annotations
@@ -31,6 +29,7 @@ from transformers import (
 # Local modules
 from data_utils import get_dataset  # noqa: E402
 from telemetry import Telemetry  # noqa: E402
+from hardcoded_prompts import get_hardcoded_prompts
 
 
 # --------------------------------------------------------------------------------------
@@ -44,7 +43,7 @@ def setup_logging(verbosity: int = 1) -> None:
 
 
 # --------------------------------------------------------------------------------------
-# Numerics & Sampling
+# Numerics & Token Selection
 # --------------------------------------------------------------------------------------
 def _safe_probs(logits: torch.Tensor) -> torch.Tensor:
     """Stable softmax (float32) with NaN/Inf guards."""
@@ -54,58 +53,11 @@ def _safe_probs(logits: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _apply_top_p(probs: torch.Tensor, top_p: float) -> torch.Tensor:
-    """Apply nucleus (top-p) filtering."""
-    if top_p >= 1.0:
-        return probs
-    sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-    cumsum = torch.cumsum(sorted_probs, dim=-1)
-    to_remove = cumsum > top_p
-    to_remove[..., 1:] = to_remove[..., :-1].clone()
-    to_remove[..., 0] = False
-    filtered = probs.clone()
-    filtered[sorted_idx[to_remove]] = 0.0
-    s = filtered.sum()
-    return filtered / s if s > 0 else probs
-
-
-def _multinomial_from_logits(
-    logits: torch.Tensor,
-    temperature: float = 1.0,
-    top_p: float = 1.0,
-) -> int:
-    """Sample token id from logits."""
-    scaled = logits / max(1e-8, temperature)
-    probs = _apply_top_p(_safe_probs(scaled), top_p)
-    return torch.multinomial(probs, 1).item()
-
-
-def _accept_or_resample(
-    draft_logits_pos: torch.Tensor,
-    target_logits_pos: torch.Tensor,
-    drafted_token_id: int,
-    rng: Optional[torch.Generator] = None,
-) -> Tuple[int, bool, float]:
-    """Acceptance–rejection for one position."""
-    device = target_logits_pos.device
-    draft_logits_pos = draft_logits_pos.to(device)
-    vocab = min(draft_logits_pos.shape[-1], target_logits_pos.shape[-1])
-    draft_logits_pos, target_logits_pos = draft_logits_pos[..., :vocab], target_logits_pos[..., :vocab]
-
-    q = _safe_probs(draft_logits_pos)
-    p = _safe_probs(target_logits_pos)
-    qd = torch.clamp(q[drafted_token_id], min=1e-12)
-    pd = p[drafted_token_id]
-    alpha = float(torch.minimum(pd / qd, torch.tensor(1.0, device=device)).item())
-    u = torch.rand((), generator=rng, device=device)
-
-    if u < alpha:
-        return drafted_token_id, True, alpha
-
-    residual = (p - alpha * q).clamp_min(0.0)
-    s = residual.sum()
-    out = torch.multinomial((residual / s if s > 0 else p), 1).item()
-    return out, False, alpha
+def _greedy_from_logits(logits: torch.Tensor) -> int:
+    """
+    Selects the token with the highest probability (argmax).
+    """
+    return torch.argmax(logits, dim=-1).item()
 
 
 # --------------------------------------------------------------------------------------
@@ -177,6 +129,7 @@ class SpecResult:
     windows_total: int
     accepted_mean_prefix_len: float
     speedup_factor: float
+    num_fallback_triggers: int = 0
 
 
 def _verify_logits_for_window(
@@ -199,7 +152,7 @@ def _verify_logits_for_window(
     return tgt_logits_full[:, start:-1, :], drf_logits_full[:, start:-1, :]
 
 
-def _run_baseline(prompt, model, tokenizer, max_new_tokens, temperature, top_p):
+def _run_baseline(prompt, model, tokenizer, max_new_tokens):
     """Plain autoregressive generation to measure tokens/sec."""
     input_ids, attn_mask = _encode(prompt, tokenizer, model.device)
     gen_ids = input_ids.clone()
@@ -210,7 +163,7 @@ def _run_baseline(prompt, model, tokenizer, max_new_tokens, temperature, top_p):
         with torch.no_grad():
             out = model(gen_ids, attention_mask=attn_mask, use_cache=True)
         logits = out.logits[0, -1, :]
-        token = _multinomial_from_logits(logits, temperature, top_p)
+        token = _greedy_from_logits(logits) # CHANGED: Now uses greedy selection
         gen_ids = torch.cat([gen_ids, torch.tensor([[token]], device=model.device)], dim=1)
         attn_mask = torch.cat([attn_mask, torch.ones((1, 1), device=model.device)], dim=1)
         if token == tokenizer.eos_token_id:
@@ -231,16 +184,11 @@ def speculative_decoding(
     max_new_tokens: int,
     L: int,
     telemetry: Optional[Telemetry],
-    temperature: float = 0.6,
-    top_p: float = 1.0,
+    kl_threshold: float = -1.0,
     verbose: bool = False,
 ) -> SpecResult:
     """
-    Correct speculative decoding loop.
-    - Runs draft for L tokens.
-    - Gets target logits for the same window.
-    - Performs proper acceptance–rejection per token.
-    - Keeps caches consistent.
+    Speculative decoding with optional KL-threshold fallback controller.
     """
 
     device = target_model.device
@@ -251,103 +199,114 @@ def speculative_decoding(
     torch.cuda.synchronize()
     t0_total = time.time()
 
-    # ---------- Initial state ----------
     current_input = prompt_ids
     current_mask = prompt_mask
+    execute_fallback = False
+    num_fallback_triggers = 0
 
     while len(generated) < max_new_tokens:
         windows_total += 1
 
-        # ---------------------- Draft phase ----------------------
-        with torch.no_grad():
-            out_draft = draft_model(current_input, attention_mask=current_mask, use_cache=False)
-        logits_draft = out_draft.logits[0, -1, :]
-        draft_tokens = []
-        for _ in range(L):
-            next_id = _multinomial_from_logits(logits_draft, temperature, top_p)
-            draft_tokens.append(next_id)
-            input_ids = torch.tensor([[next_id]], device=device)
+        # ---------- FALLBACK MODE ----------
+        if execute_fallback:
+            num_fallback_triggers += 1
+            if verbose:
+                logging.info(f"[Controller] High KL detected → Executing two-token corrective fallback.")
+
             with torch.no_grad():
-                out_draft = draft_model(input_ids, use_cache=True)
+                out_target = target_model(current_input, attention_mask=current_mask)
+                logits = out_target.logits[0, -1, :]
+            extra_token = _greedy_from_logits(logits) # CHANGED: Now uses greedy selection
+            out_tokens = [extra_token]
+
+            execute_fallback = False  # reset flag
+        else:
+            # ---------- NORMAL SPECULATION ----------
+            with torch.no_grad():
+                out_draft = draft_model(current_input, attention_mask=current_mask, use_cache=False)
             logits_draft = out_draft.logits[0, -1, :]
+            draft_tokens = []
+            for _ in range(L):
+                next_id = _greedy_from_logits(logits_draft) # CHANGED: Now uses greedy selection
+                draft_tokens.append(next_id)
+                input_ids = torch.tensor([[next_id]], device=device)
+                with torch.no_grad():
+                    out_draft = draft_model(input_ids, use_cache=True)
+                logits_draft = out_draft.logits[0, -1, :]
 
-        total_drafted += len(draft_tokens)
+            total_drafted += len(draft_tokens)
 
-        # ---------------------- Target verification ----------------------
-        tgt_logits_seq, drf_logits_seq = _verify_logits_for_window(
-            current_input, current_mask, draft_tokens, draft_model, target_model
-        )
-        tgt_logits_seq = tgt_logits_seq.squeeze(0)
-        drf_logits_seq = drf_logits_seq.squeeze(0)
+            # ----- Target verification -----
+            tgt_logits_seq, drf_logits_seq = _verify_logits_for_window(
+                current_input, current_mask, draft_tokens, draft_model, target_model
+            )
+            tgt_logits_seq = tgt_logits_seq.squeeze(0)
+            drf_logits_seq = drf_logits_seq.squeeze(0)
 
-        with torch.no_grad():
-            p = torch.log_softmax(tgt_logits_seq, dim=-1)
-            q = torch.log_softmax(drf_logits_seq, dim=-1)
-            kl_per_token = torch.sum(torch.exp(p) * (p - q), dim=-1)  # shape: (L,)
-            kl_mean = kl_per_token.mean().item()
-        if telemetry:
-            telemetry.log_step({
-                "window_index": windows_total,
-                "window_kl_mean": kl_mean,
-                "kl_per_token": kl_per_token.tolist(),
-            })
+            with torch.no_grad():
+                p = torch.log_softmax(tgt_logits_seq, dim=-1)
+                q = torch.log_softmax(drf_logits_seq, dim=-1)
+                kl_per_token = torch.sum(torch.exp(p) * (p - q), dim=-1)
+                kl_mean = kl_per_token.mean().item()
 
-        accepted_len = 0
-        out_tokens: List[int] = []
-        reject_triggered = False
+            if telemetry:
+                telemetry.log_step({
+                    "window_index": windows_total,
+                    "window_kl_mean": kl_mean,
+                    "kl_per_token": kl_per_token.tolist(),
+                })
 
-        for j, drafted_id in enumerate(draft_tokens):
-            p = _safe_probs(tgt_logits_seq[j])
-            q = _safe_probs(drf_logits_seq[j])
+            accepted_len = 0
+            out_tokens: List[int] = []
+            reject_triggered = False
 
-            vocab = min(p.shape[-1], q.shape[-1])
-            p, q = p[:vocab], q[:vocab]
-            pd, qd = p[drafted_id], q[drafted_id]
-            alpha = min(1.0, (pd / max(qd, 1e-12)).item())
-            u = torch.rand(1, device=device).item()
+            for j, drafted_id in enumerate(draft_tokens):
+                p = _safe_probs(tgt_logits_seq[j])
+                q = _safe_probs(drf_logits_seq[j])
+                vocab = min(p.shape[-1], q.shape[-1])
+                p, q = p[:vocab], q[:vocab]
+                pd, qd = p[drafted_id], q[drafted_id]
+                alpha = min(1.0, (pd / max(qd, 1e-12)).item())
+                u = torch.rand(1, device=device).item()
+                if u < alpha:
+                    accepted_len += 1
+                    out_tokens.append(drafted_id)
+                    continue
+                residual = (p - alpha * q).clamp_min(0)
+                # CHANGED: Use argmax on the residual distribution for rejection
+                res_id = torch.argmax(residual).item()
+                out_tokens.append(res_id)
+                reject_triggered = True
+                break
 
-            if u < alpha:
-                accepted_len += 1
-                out_tokens.append(drafted_id)
-                continue
+            if not reject_triggered:
+                # CHANGED: Use argmax for the bonus token
+                next_id = torch.argmax(tgt_logits_seq[-1]).item()
+                out_tokens.append(next_id)
 
-            # Reject: sample residual
-            residual = (p - alpha * q).clamp_min(0)
-            residual /= residual.sum() if residual.sum() > 0 else 1
-            res_id = torch.multinomial(residual, 1).item()
-            out_tokens.append(res_id)
-            reject_triggered = True
-            break
+            total_accepted += accepted_len
+            accepted_prefixes.append(accepted_len)
 
-        # If all L accepted, draw one extra from target’s last logits
-        if not reject_triggered:
-            p_last = _safe_probs(tgt_logits_seq[-1])
-            next_id = torch.multinomial(p_last, 1).item()
-            out_tokens.append(next_id)
+            # ---- Controller decision ----
+            if kl_threshold > 0 and kl_mean > kl_threshold:
+                execute_fallback = True
+                if verbose:
+                    logging.info(f"[Controller] KL={kl_mean:.4f} > {kl_threshold:.4f} → fallback armed.")
 
-        total_accepted += accepted_len
-        accepted_prefixes.append(accepted_len)
+        # ---------- Context update ----------
         generated.extend(out_tokens)
+        current_input = torch.cat([current_input, torch.tensor([out_tokens], device=device)], dim=1)
+        current_mask = torch.cat([current_mask, torch.ones((1, len(out_tokens)), device=device)], dim=1)
 
-        # ---------------------- Update context ----------------------
-        current_input = torch.cat(
-            [current_input, torch.tensor([out_tokens], device=device)], dim=1
-        )
-        current_mask = torch.cat(
-            [current_mask, torch.ones((1, len(out_tokens)), device=device)], dim=1
-        )
-
-        if any(t == tokenizer.eos_token_id for t in out_tokens):
-            break
-        if len(generated) >= max_new_tokens:
+        if any(t == tokenizer.eos_token_id for t in out_tokens) or len(generated) >= max_new_tokens:
             break
 
         if telemetry:
             telemetry.log_step({
                 "window": {
-                    "accepted_prefix_length": accepted_len,
-                    "drafted": len(draft_tokens),
-                    "accept_ratio": accepted_len / max(len(draft_tokens), 1),
+                    "accepted_prefix_length": accepted_len if not execute_fallback else 0,
+                    "drafted": len(out_tokens),
+                    "accept_ratio": accepted_len / max(len(out_tokens), 1),
                 }
             })
 
@@ -366,6 +325,7 @@ def speculative_decoding(
         windows_total=windows_total,
         accepted_mean_prefix_len=mean_prefix,
         speedup_factor=tps,
+        num_fallback_triggers=num_fallback_triggers,
     )
 
 
@@ -380,12 +340,13 @@ def append_csv_row(csv_path: str, header: List[str], row: List[object]) -> None:
             writer.writerow(header)
         writer.writerow(row)
 
+
 # --------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Speculative Decoding Benchmark (Cleaned)")
-    p.add_argument("--dataset", type=str, default="alpaca-mini")
+    p = argparse.ArgumentParser(description="Speculative Decoding Benchmark (Greedy Version)")
+    p.add_argument("--dataset", type=str, default="hardcoded")
     p.add_argument("--num_samples", type=int, default=10)
     p.add_argument("--prompt", type=str, default=None)
     p.add_argument("--cache_dir", type=str, default="/home1/10899/kimopro/SCRATCH/ml_data")
@@ -393,44 +354,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--target_model", type=str, default="meta-llama/Llama-2-70b-chat-hf")
     p.add_argument("--max_new_tokens", type=int, default=50)
     p.add_argument("--L", type=int, default=4)
-    p.add_argument("--temperature", type=float, default=0.6)
-    p.add_argument("--top_p", type=float, default=1.0)
     p.add_argument("--output", type=str, default="telemetry.jsonl")
     p.add_argument("--csv_output", type=str, default="results.csv")
     p.add_argument("-v", "--verbose", action="count", default=1)
+    p.add_argument("--kl_threshold", type=float, default=-1.0, help="KL divergence threshold to trigger the two-token corrective fallback. If <= 0, disabled.")
     return p
-
-
-def _run_baseline(prompt, model, tokenizer, max_new_tokens, temperature, top_p):
-    """Plain autoregressive generation to measure tokens/sec."""
-    input_ids, attn_mask = _encode(prompt, tokenizer, model.device)
-    gen_ids = input_ids.clone()
-
-    torch.cuda.synchronize()
-    t0 = time.time()
-
-    for _ in range(max_new_tokens):
-        with torch.no_grad():
-            out = model(gen_ids, attention_mask=attn_mask, use_cache=True)
-        logits = out.logits[0, -1, :]
-        token = _multinomial_from_logits(logits, temperature, top_p)
-        gen_ids = torch.cat([gen_ids, torch.tensor([[token]], device=model.device)], dim=1)
-        attn_mask = torch.cat([attn_mask, torch.ones((1, 1), device=model.device)], dim=1)
-        if token == tokenizer.eos_token_id:
-            break
-
-    torch.cuda.synchronize()
-    runtime = time.time() - t0
-    tokens = gen_ids.shape[1] - input_ids.shape[1]
-    tps = tokens / runtime if runtime > 0 else 0.0
-    return runtime, tokens, tps
 
 
 def main() -> None:
     args = build_arg_parser().parse_args()
     setup_logging(args.verbose)
 
-    logging.info("Starting Speculative Decoding Benchmark (Empirical Speedup Mode)")
+    logging.info("Starting Speculative Decoding Benchmark (Greedy Mode)")
 
     # ------------------------------------------------------------------
     # Prompts
@@ -438,8 +373,12 @@ def main() -> None:
     if args.prompt:
         raw_prompts = [args.prompt]
     else:
-        all_prompts = get_dataset(args.dataset, subset_size=args.num_samples * 2, cache_dir=args.cache_dir)
-        raw_prompts = all_prompts[: args.num_samples]
+        if args.dataset == "hardcoded":
+            print("Using hardcoded prompts for testing.")
+            raw_prompts = get_hardcoded_prompts()
+        else:
+            all_prompts = get_dataset(args.dataset, subset_size=args.num_samples * 2, cache_dir=args.cache_dir)
+            raw_prompts = all_prompts[: args.num_samples]
 
     # ------------------------------------------------------------------
     # Load models & tokenizer
@@ -455,6 +394,7 @@ def main() -> None:
         "draft_time", "draft_tokens", "draft_tps",
         "speedup_vs_target",
         "accepted_mean_prefix_len",
+        "num_fallback_triggers",
     ]
 
     # ------------------------------------------------------------------
@@ -467,7 +407,7 @@ def main() -> None:
         # ---- 1. Draft-only baseline ----
         t_draft, toks_draft, tps_draft = _run_baseline(
             prompt, bundle.draft, bundle.tokenizer,
-            args.max_new_tokens, args.temperature, args.top_p
+            args.max_new_tokens
         )
         logging.info("[DRAFT] time=%.2fs | tokens=%d | %.2f tok/s",
                      t_draft, toks_draft, tps_draft)
@@ -475,7 +415,7 @@ def main() -> None:
         # ---- 2. Target-only baseline ----
         t_target, toks_target, tps_target = _run_baseline(
             prompt, bundle.target, bundle.tokenizer,
-            args.max_new_tokens, args.temperature, args.top_p
+            args.max_new_tokens
         )
         logging.info("[TARGET] time=%.2fs | tokens=%d | %.2f tok/s",
                      t_target, toks_target, tps_target)
@@ -489,8 +429,7 @@ def main() -> None:
             max_new_tokens=args.max_new_tokens,
             L=args.L,
             telemetry=telemetry,
-            temperature=args.temperature,
-            top_p=args.top_p,
+            kl_threshold=args.kl_threshold,
             verbose=(i < 2),
         )
         spec_tps = spec.num_tokens / max(spec.runtime, 1e-9)
@@ -510,6 +449,7 @@ def main() -> None:
             t_draft, toks_draft, tps_draft,
             speedup_vs_target,
             spec.accepted_mean_prefix_len,
+            spec.num_fallback_triggers,
         ]
         append_csv_row(args.csv_output, header, row)
 
@@ -530,7 +470,6 @@ def main() -> None:
 
     telemetry.close()
     logging.info("Done. Results written to %s", args.csv_output)
-
 
 
 if __name__ == "__main__":

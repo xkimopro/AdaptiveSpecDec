@@ -1,3 +1,6 @@
 .pip_cache/
 __pycache__/
-*.jsonl
+*.jsonl# pixi environments
+.pixi/*
+!.pixi/config.toml
+telemetry.jsonl
