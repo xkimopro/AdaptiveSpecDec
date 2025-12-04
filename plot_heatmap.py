@@ -11,9 +11,7 @@ pattern = re.compile(r"results_L(?P<L>\d+)_KL(?P<KL>[\d_.-]+)\.csv")
 
 records = []
 
-# -----------------------------------------------------------------------------
-# 1. Parse Data
-# -----------------------------------------------------------------------------
+# Parse Data
 if not os.path.exists(ROOT):
     print(f"Directory {ROOT} not found.")
 else:
@@ -48,9 +46,7 @@ if agg.empty:
 else:
     agg = agg.sort_values(["L", "KL"])
 
-    # -----------------------------------------------------------------------------
-    # 2. Heatmap (unchanged)
-    # -----------------------------------------------------------------------------
+    # Heatmap
     pivot_table = agg.pivot(index="KL", columns="L", values="mean_speedup")
     pivot_table = pivot_table.sort_index(ascending=False)
 
@@ -63,9 +59,7 @@ else:
     plt.savefig("aggregated_results_heatmap.png")
     print("✅ Heatmap saved.")
 
-    # -----------------------------------------------------------------------------
-    # 3. Generate Minimal LaTeX Table
-    # -----------------------------------------------------------------------------
+    # Generate Minimal LaTeX Table
 
     latex_rows = []
 
@@ -123,4 +117,4 @@ else:
     print("\n--- Generated Minimal LaTeX Table ---")
     print(latex_table)
     print("-----------------------------")
-    print("✅ LaTeX table saved to 'summary_table.tex'")
+    print("LaTeX table saved to 'summary_table.tex'")

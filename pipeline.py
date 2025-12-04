@@ -31,20 +31,14 @@ from data_utils import get_dataset  # noqa: E402
 from telemetry import Telemetry  # noqa: E402
 from hardcoded_prompts import get_hardcoded_prompts
 
-
-# --------------------------------------------------------------------------------------
 # Logging
-# --------------------------------------------------------------------------------------
 def setup_logging(verbosity: int = 1) -> None:
     level = logging.WARNING if verbosity <= 0 else logging.INFO if verbosity == 1 else logging.DEBUG
     fmt = "%(asctime)s | %(levelname)s | %(message)s"
     datefmt = "%H:%M:%S"
     logging.basicConfig(level=level, format=fmt, datefmt=datefmt)
 
-
-# --------------------------------------------------------------------------------------
 # Numerics & Token Selection
-# --------------------------------------------------------------------------------------
 def _safe_probs(logits: torch.Tensor) -> torch.Tensor:
     """Stable softmax (float32) with NaN/Inf guards."""
     return torch.softmax(
@@ -60,9 +54,7 @@ def _greedy_from_logits(logits: torch.Tensor) -> int:
     return torch.argmax(logits, dim=-1).item()
 
 
-# --------------------------------------------------------------------------------------
 # Model / Tokenizer Loading
-# --------------------------------------------------------------------------------------
 @dataclass
 class ModelBundle:
     draft: PreTrainedModel
@@ -104,9 +96,7 @@ def load_models_and_tokenizer(
     return ModelBundle(draft=draft, target=target, tokenizer=tok)
 
 
-# --------------------------------------------------------------------------------------
 # Generation helpers
-# --------------------------------------------------------------------------------------
 def _encode(prompt: str, tokenizer: PreTrainedTokenizerBase, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
     enc = tokenizer(prompt, return_tensors="pt")
     return enc.input_ids.to(device), enc.attention_mask.to(device)
@@ -116,9 +106,7 @@ def _decode(tokenizer: PreTrainedTokenizerBase, ids: Sequence[int]) -> str:
     return tokenizer.decode(ids, skip_special_tokens=True)
 
 
-# --------------------------------------------------------------------------------------
 # Speculative Decoding (Always ON)
-# --------------------------------------------------------------------------------------
 @dataclass
 class SpecResult:
     text: str
@@ -329,9 +317,7 @@ def speculative_decoding(
     )
 
 
-# --------------------------------------------------------------------------------------
 # CSV Logging
-# --------------------------------------------------------------------------------------
 def append_csv_row(csv_path: str, header: List[str], row: List[object]) -> None:
     write_header = not os.path.exists(csv_path)
     with open(csv_path, "a", newline="") as f:
@@ -341,9 +327,7 @@ def append_csv_row(csv_path: str, header: List[str], row: List[object]) -> None:
         writer.writerow(row)
 
 
-# --------------------------------------------------------------------------------------
 # CLI
-# --------------------------------------------------------------------------------------
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Speculative Decoding Benchmark (Greedy Version)")
     p.add_argument("--dataset", type=str, default="hardcoded")
@@ -367,9 +351,7 @@ def main() -> None:
 
     logging.info("Starting Speculative Decoding Benchmark (Greedy Mode)")
 
-    # ------------------------------------------------------------------
     # Prompts
-    # ------------------------------------------------------------------
     if args.prompt:
         raw_prompts = [args.prompt]
     else:
@@ -380,9 +362,7 @@ def main() -> None:
             all_prompts = get_dataset(args.dataset, subset_size=args.num_samples * 2, cache_dir=args.cache_dir)
             raw_prompts = all_prompts[: args.num_samples]
 
-    # ------------------------------------------------------------------
     # Load models & tokenizer
-    # ------------------------------------------------------------------
     bundle = load_models_and_tokenizer(args.draft_model, args.target_model, args.cache_dir)
     telemetry = Telemetry(args.output)
 
@@ -397,9 +377,7 @@ def main() -> None:
         "num_fallback_triggers",
     ]
 
-    # ------------------------------------------------------------------
     # Main loop
-    # ------------------------------------------------------------------
     for i, prompt in enumerate(raw_prompts):
         logging.info("=" * 80)
         logging.info("Sample %d/%d", i + 1, len(raw_prompts))

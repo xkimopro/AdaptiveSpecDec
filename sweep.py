@@ -14,9 +14,7 @@ import os
 import json
 from datetime import datetime
 
-# -----------------------------------------------------------------------------
 # Configuration
-# -----------------------------------------------------------------------------
 L_values = [4, 8, 12, 16, 24]
 kl_thresholds = [-1.0, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5 , 5.0]
 dataset = "hardcoded"
@@ -27,34 +25,26 @@ base_output_dir = "./sweep_results_kl"
 max_new_tokens = 240
 verbosity = 1  # number of -v flags
 
-# -----------------------------------------------------------------------------
 # Setup
-# -----------------------------------------------------------------------------
 os.makedirs(base_output_dir, exist_ok=True)
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 logfile = os.path.join(base_output_dir, f"sweep_{timestamp}.log")
 checkpoint_path = os.path.join(base_output_dir, "checkpoint.json")
 
-print(f"🚀 Starting parameter sweep with checkpointing. Log: {logfile}")
+print(f"Starting parameter sweep with checkpointing. Log: {logfile}")
 
-# -----------------------------------------------------------------------------
 # Load checkpoint
-# -----------------------------------------------------------------------------
 if os.path.exists(checkpoint_path):
     with open(checkpoint_path, "r") as f:
         completed = set(json.load(f))
-    print(f"🔁 Loaded checkpoint: {len(completed)} runs already completed.")
+    print(f"Loaded checkpoint: {len(completed)} runs already completed.")
 else:
     completed = set()
 
-# -----------------------------------------------------------------------------
 # Generate parameter grid
-# -----------------------------------------------------------------------------
 param_grid = [(L, kl) for kl in kl_thresholds for L in L_values]
 
-# -----------------------------------------------------------------------------
 # Sweep loop
-# -----------------------------------------------------------------------------
 with open(logfile, "a") as log:
     for L, kl in param_grid:
         run_id = f"L{L}_KL{str(kl).replace('.', '_')}"
@@ -63,7 +53,7 @@ with open(logfile, "a") as log:
 
         # Skip already finished
         if run_id in completed or os.path.exists(csv_path):
-            print(f"✅ Skipping {run_id} (already done).")
+            print(f"Skipping {run_id} (already done).")
             continue
 
         print(f"--> Launching run: L={L}, KL_Threshold={kl}")
@@ -99,18 +89,18 @@ with open(logfile, "a") as log:
             log.write(f"--- Run {run_id} finished successfully. ---\n")
             log.flush()
 
-            # ✅ Update checkpoint
+            # Update checkpoint
             completed.add(run_id)
             with open(checkpoint_path, "w") as f:
                 json.dump(sorted(list(completed)), f, indent=2)
 
         except subprocess.CalledProcessError as e:
-            error_message = f"❌ Run failed for {run_id}: {e}\n"
+            error_message = f"Run failed for {run_id}: {e}\n"
             print(error_message)
             log.write(error_message)
             log.flush()
             # Keep checkpoint intact so failed runs can retry later
             continue
 
-print(f"\n🏁 Sweep complete. Logs and CSVs in: {base_output_dir}")
+print(f"\nSweep complete. Logs and CSVs in: {base_output_dir}")
 print(f"Checkpoint file: {checkpoint_path}")

@@ -39,9 +39,7 @@ print(agg)
 # Create a big figure with two subplots
 fig, axes = plt.subplots(2, 1, figsize=(12, 12), sharex=True)
 
-# -------------------------
 # Plot 1: Speedup vs target
-# -------------------------
 for L, group in agg.groupby("L"):
     axes[0].plot(group["KL"], group["mean_speedup"], marker="o", label=f"L={L}")
 
@@ -50,9 +48,7 @@ axes[0].set_ylabel("Mean speedup_vs_target")
 axes[0].grid(True)
 axes[0].legend(title="L")
 
-# -----------------------------------------
 # Plot 2: Accepted mean prefix length
-# -----------------------------------------
 for L, group in agg.groupby("L"):
     axes[1].plot(group["KL"], group["mean_prefix"], marker="o", label=f"L={L}")
 

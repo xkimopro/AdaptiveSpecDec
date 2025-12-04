@@ -149,7 +149,7 @@ def main():
     baseline_speedup = baseline_tokens / len(windows_data) if windows_data else 0
 
     print("\n" + "=" * 60)
-    print("                 Analysis Complete")
+    print("Analysis Complete")
     print("=" * 60)
     print(f"Baseline Performance (No Controller): {baseline_speedup:.4f} Tokens/Pass")
     print(f"Optimal Performance (With Controller):  {max_speedup:.4f} Tokens/Pass")
