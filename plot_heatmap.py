@@ -57,7 +57,7 @@ else:
     plt.ylabel("KL Threshold")
     plt.tight_layout()
     plt.savefig("aggregated_results_heatmap.png")
-    print("✅ Heatmap saved.")
+    print("Heatmap saved.")
 
     # Generate Minimal LaTeX Table
 
