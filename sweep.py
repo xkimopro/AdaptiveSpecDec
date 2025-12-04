@@ -17,14 +17,14 @@ from datetime import datetime
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
-L_values = [4, 8, 12, 16]
-kl_thresholds = [-1.0, 1.0, 2.0, 3.0, 4.0]
+L_values = [4, 8, 12, 16, 24]
+kl_thresholds = [-1.0, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5 , 5.0]
 dataset = "hardcoded"
 draft_model = "meta-llama/Llama-2-7b-chat-hf"
 target_model = "meta-llama/Llama-2-70b-chat-hf"
 cache_dir = "/home1/10899/kimopro/SCRATCH/ml_data"
 base_output_dir = "./sweep_results_kl"
-max_new_tokens = 120
+max_new_tokens = 240
 verbosity = 1  # number of -v flags
 
 # -----------------------------------------------------------------------------
